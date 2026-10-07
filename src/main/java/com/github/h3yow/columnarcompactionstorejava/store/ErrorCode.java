@@ -17,5 +17,11 @@ public enum ErrorCode {
     /** A segment file on disk is corrupted (bad magic, length or checksum). */
     CORRUPT_SEGMENT,
     /** Operation attempted on a closed store. */
-    STORE_CLOSED
+    STORE_CLOSED,
+    /** Too many concurrent snapshots or too much snapshot-pinned data; caller may retry later. */
+    SNAPSHOT_LIMIT_EXCEEDED,
+    /** Operation attempted on a snapshot that was already released. */
+    SNAPSHOT_CLOSED,
+    /** The snapshot can no longer be served consistently (its pinned data is gone). */
+    SNAPSHOT_EXPIRED
 }

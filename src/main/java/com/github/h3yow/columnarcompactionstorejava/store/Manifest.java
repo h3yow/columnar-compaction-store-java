@@ -1,5 +1,6 @@
 package com.github.h3yow.columnarcompactionstorejava.store;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -14,39 +15,68 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.LongSupplier;
 
 /**
  * Persistent catalog: current {@link Schema} plus the ordered list of live
- * segment file names. This is the single source of truth for snapshot
+ * segment references. This is the single source of truth for snapshot
  * visibility — a reader that has loaded a manifest sees exactly the segments
  * it lists, never a half-compacted state.
+ *
+ * <p>Each manifest mutation (write, compaction, schema change, retention
+ * cleanup) bumps {@link #version()}; an explicitly opened
+ * {@link VersionSnapshot} pins one such version.
  *
  * <p>Updates are written to {@code manifest.json.tmp}, fsynced, then
  * atomically renamed over {@code manifest.json}; a crash can therefore leave
  * either the old or the new manifest, never a torn one.
+ *
+ * <p>Backward compatibility: manifests written before segments carried
+ * timestamps (a plain string array, no {@code version} field) load with
+ * {@code version = 0} and each segment's creation time set to the load
+ * instant, so pre-existing data is never considered expired right after an
+ * upgrade.
  */
 public final class Manifest {
+
+    /** A live segment: file name plus creation time (millis) used by retention. */
+    public record SegmentRef(String name, long createdAtMillis) {
+    }
 
     public static final String FILE_NAME = "manifest.json";
     private static final String TMP_NAME = FILE_NAME + ".tmp";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final Schema schema;
-    private final List<String> liveSegments;
+    private final List<SegmentRef> segments;
     private final long compactionGeneration;
+    private final long version;
 
-    public Manifest(Schema schema, List<String> liveSegments, long compactionGeneration) {
+    private Manifest(Schema schema, List<SegmentRef> segments,
+                     long compactionGeneration, long version) {
         this.schema = schema;
-        this.liveSegments = List.copyOf(liveSegments);
+        this.segments = List.copyOf(segments);
         this.compactionGeneration = compactionGeneration;
+        this.version = version;
+    }
+
+    /** A fresh, empty manifest for a newly created store. */
+    public static Manifest empty(Schema schema) {
+        return new Manifest(schema, List.of(), 0, 0);
     }
 
     public Schema schema() {
         return schema;
     }
 
+    /** Names of live segments, in write order. */
     public List<String> liveSegments() {
-        return liveSegments;
+        return segments.stream().map(SegmentRef::name).toList();
+    }
+
+    /** Live segments with their creation timestamps, in write order. */
+    public List<SegmentRef> segmentRefs() {
+        return segments;
     }
 
     /** Monotonic counter bumped by every successful compaction. */
@@ -54,16 +84,29 @@ public final class Manifest {
         return compactionGeneration;
     }
 
-    public Manifest withSegments(List<String> segments, long generation) {
-        return new Manifest(schema, segments, generation);
+    /** Monotonic data version bumped by every manifest mutation. */
+    public long version() {
+        return version;
+    }
+
+    public Manifest withSegments(List<SegmentRef> newSegments, long generation) {
+        return new Manifest(schema, newSegments, generation, version + 1);
     }
 
     public Manifest withSchema(Schema newSchema) {
-        return new Manifest(newSchema, liveSegments, compactionGeneration);
+        return new Manifest(newSchema, segments, compactionGeneration, version + 1);
     }
 
     /** Loads the manifest from {@code dir}, or {@code null} if none exists yet. */
     public static Manifest load(Path dir) {
+        return load(dir, System::currentTimeMillis);
+    }
+
+    /**
+     * Loads the manifest, stamping legacy timestamp-less segments with
+     * {@code clock.getAsLong()}.
+     */
+    public static Manifest load(Path dir, LongSupplier clock) {
         Path file = dir.resolve(FILE_NAME);
         if (!Files.exists(file)) {
             return null;
@@ -78,12 +121,21 @@ public final class Manifest {
             }
             int schemaVersion = root.get("schemaVersion").asInt();
             Schema schema = Schema.of(schemaVersion, columns);
-            List<String> segments = new ArrayList<>();
-            for (var segNode : root.withArray("segments")) {
-                segments.add(segNode.asText());
+            List<SegmentRef> segments = new ArrayList<>();
+            for (JsonNode segNode : root.withArray("segments")) {
+                if (segNode.isTextual()) {
+                    // legacy format: bare file name, no creation time recorded
+                    segments.add(new SegmentRef(segNode.asText(), clock.getAsLong()));
+                } else {
+                    segments.add(new SegmentRef(
+                            segNode.get("name").asText(),
+                            segNode.get("createdAt").asLong()));
+                }
             }
             long generation = root.get("compactionGeneration").asLong();
-            return new Manifest(schema, segments, generation);
+            JsonNode versionNode = root.get("version");
+            long version = versionNode == null ? 0 : versionNode.asLong();
+            return new Manifest(schema, segments, generation, version);
         } catch (IOException | RuntimeException e) {
             throw new StoreException(ErrorCode.CORRUPT_SEGMENT,
                     "unreadable manifest " + file + ": " + e.getMessage(), e);
@@ -103,10 +155,13 @@ public final class Manifest {
             c.put("type", col.type().name());
         }
         ArrayNode segs = root.putArray("segments");
-        for (String seg : liveSegments) {
-            segs.add(seg);
+        for (SegmentRef seg : segments) {
+            ObjectNode s = segs.addObject();
+            s.put("name", seg.name());
+            s.put("createdAt", seg.createdAtMillis());
         }
         root.put("compactionGeneration", compactionGeneration);
+        root.put("version", version);
         try (OutputStream out = Files.newOutputStream(tmp)) {
             MAPPER.writerWithDefaultPrettyPrinter().writeValue(out, root);
             try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
@@ -127,7 +182,8 @@ public final class Manifest {
 
     @Override
     public String toString() {
-        return "Manifest{schema=" + schema + ", segments=" + liveSegments
-                + ", compactionGeneration=" + compactionGeneration + "}";
+        return "Manifest{schema=" + schema + ", segments=" + segments
+                + ", compactionGeneration=" + compactionGeneration
+                + ", version=" + version + "}";
     }
 }
