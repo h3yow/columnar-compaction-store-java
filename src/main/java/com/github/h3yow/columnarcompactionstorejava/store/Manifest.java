@@ -34,11 +34,20 @@ public final class Manifest {
     private final Schema schema;
     private final List<String> liveSegments;
     private final long compactionGeneration;
+    /** Every version ever made visible, oldest first; trimmed by retention. */
+    private final List<VersionInfo> history;
 
+    /** Compatibility constructor used before versions existed. */
     public Manifest(Schema schema, List<String> liveSegments, long compactionGeneration) {
+        this(schema, liveSegments, compactionGeneration, List.of());
+    }
+
+    public Manifest(Schema schema, List<String> liveSegments, long compactionGeneration,
+                    List<VersionInfo> history) {
         this.schema = schema;
         this.liveSegments = List.copyOf(liveSegments);
         this.compactionGeneration = compactionGeneration;
+        this.history = List.copyOf(history);
     }
 
     public Schema schema() {
@@ -54,12 +63,45 @@ public final class Manifest {
         return compactionGeneration;
     }
 
+    /** Oldest-first catalog of retained historical versions. */
+    public List<VersionInfo> history() {
+        return history;
+    }
+
+    /** Latest visible version, or {@code null} before the first write. */
+    public VersionInfo headVersion() {
+        return history.isEmpty() ? null : history.get(history.size() - 1);
+    }
+
+    /** Looks up a version by id. */
+    public VersionInfo version(long versionId) {
+        for (VersionInfo v : history) {
+            if (v.versionId() == versionId) {
+                return v;
+            }
+        }
+        return null;
+    }
+
     public Manifest withSegments(List<String> segments, long generation) {
-        return new Manifest(schema, segments, generation);
+        return new Manifest(schema, segments, generation, history);
+    }
+
+    /** Records a new visible version together with its live-segment set. */
+    public Manifest withNewVersion(List<String> segments, long generation,
+                                   VersionInfo newVersion) {
+        List<VersionInfo> next = new ArrayList<>(history);
+        next.add(newVersion);
+        return new Manifest(schema, segments, generation, next);
+    }
+
+    /** Replaces the version catalog (retention trim / startup reconciliation). */
+    public Manifest withHistory(List<VersionInfo> newHistory) {
+        return new Manifest(schema, liveSegments, compactionGeneration, newHistory);
     }
 
     public Manifest withSchema(Schema newSchema) {
-        return new Manifest(newSchema, liveSegments, compactionGeneration);
+        return new Manifest(newSchema, liveSegments, compactionGeneration, history);
     }
 
     /** Loads the manifest from {@code dir}, or {@code null} if none exists yet. */
@@ -83,7 +125,25 @@ public final class Manifest {
                 segments.add(segNode.asText());
             }
             long generation = root.get("compactionGeneration").asLong();
-            return new Manifest(schema, segments, generation);
+            List<VersionInfo> history = new ArrayList<>();
+            // Absent on stores written before versioned snapshots: old files
+            // simply have an empty version catalog.
+            if (root.has("versions") && root.get("versions").isArray()) {
+                for (var vNode : root.withArray("versions")) {
+                    List<String> vSegs = new ArrayList<>();
+                    for (var segNode : vNode.withArray("segments")) {
+                        vSegs.add(segNode.asText());
+                    }
+                    history.add(new VersionInfo(
+                            vNode.get("versionId").asLong(),
+                            vNode.get("createdAtMillis").asLong(),
+                            vNode.get("compactionGeneration").asLong(),
+                            vNode.path("schemaVersion").asInt(schema.version()),
+                            vNode.path("columnCount").asInt(columns.size()),
+                            vSegs));
+                }
+            }
+            return new Manifest(schema, segments, generation, history);
         } catch (IOException | RuntimeException e) {
             throw new StoreException(ErrorCode.CORRUPT_SEGMENT,
                     "unreadable manifest " + file + ": " + e.getMessage(), e);
@@ -107,6 +167,19 @@ public final class Manifest {
             segs.add(seg);
         }
         root.put("compactionGeneration", compactionGeneration);
+        ArrayNode versions = root.putArray("versions");
+        for (VersionInfo v : history) {
+            ObjectNode vn = versions.addObject();
+            vn.put("versionId", v.versionId());
+            vn.put("createdAtMillis", v.createdAtMillis());
+            vn.put("compactionGeneration", v.compactionGeneration());
+            vn.put("schemaVersion", v.schemaVersion());
+            vn.put("columnCount", v.columnCount());
+            ArrayNode vSegs = vn.putArray("segments");
+            for (String seg : v.segments()) {
+                vSegs.add(seg);
+            }
+        }
         try (OutputStream out = Files.newOutputStream(tmp)) {
             MAPPER.writerWithDefaultPrettyPrinter().writeValue(out, root);
             try (FileChannel ch = FileChannel.open(tmp, StandardOpenOption.WRITE)) {
@@ -128,6 +201,7 @@ public final class Manifest {
     @Override
     public String toString() {
         return "Manifest{schema=" + schema + ", segments=" + liveSegments
-                + ", compactionGeneration=" + compactionGeneration + "}";
+                + ", compactionGeneration=" + compactionGeneration
+                + ", versions=" + history.size() + "}";
     }
 }

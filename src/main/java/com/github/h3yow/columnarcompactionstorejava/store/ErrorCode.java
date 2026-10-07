@@ -17,5 +17,17 @@ public enum ErrorCode {
     /** A segment file on disk is corrupted (bad magic, length or checksum). */
     CORRUPT_SEGMENT,
     /** Operation attempted on a closed store. */
-    STORE_CLOSED
+    STORE_CLOSED,
+    /** Too many version snapshots are open at the same time. */
+    SNAPSHOT_LIMIT_EXCEEDED,
+    /** Open snapshots would pin more bytes than the configured snapshot budget. */
+    SNAPSHOT_BYTES_LIMIT_EXCEEDED,
+    /** Requested version is older than the retention window and has been expired. */
+    SNAPSHOT_VERSION_EXPIRED,
+    /** A snapshot can no longer be served consistently (its data was externally removed). */
+    SNAPSHOT_DATA_UNAVAILABLE,
+    /** Read or release attempted on a closed version snapshot. */
+    SNAPSHOT_CLOSED,
+    /** Retention cleanup was interrupted before its reclaim phase finished; safe to retry. */
+    CLEANUP_INTERRUPTED
 }

@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -169,6 +170,9 @@ public final class SegmentFormat {
                 rows.add(row);
             }
             return new SegmentData(schemaVersion, columns, rows);
+        } catch (NoSuchFileException e) {
+            throw new StoreException(ErrorCode.SNAPSHOT_DATA_UNAVAILABLE,
+                    "segment file disappeared " + file.getFileName() + ": " + e.getMessage(), e);
         } catch (EOFException e) {
             throw corrupt(file, "unexpected end of file", e);
         } catch (IOException e) {
